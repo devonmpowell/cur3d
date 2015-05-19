@@ -21,6 +21,8 @@ __host__ void cur3d_err(cudaError_t err, char* msg);
 
 __device__ r3d_int cur3du_num_clip(cur3d_element tet, r3d_dvec3 gidx, r3d_rvec3 d);
 
+__device__ r3d_int cur3du_cumsum(r3d_int* arr);
+
 
 // useful macros
 #define ONE_THIRD 0.333333333333333333333333333333333333333333333333333333
@@ -77,7 +79,6 @@ __host__ void cur3d_voxelize_elements(cur3d_element* elems_h, r3d_int nelem, r3d
 	return;
 }
 
-// single-voxel kernel
 __global__ void k_vox(cur3d_element* elems, r3d_int nelem, r3d_real* rho, r3d_dvec3 n, r3d_rvec3 d) {
 
 	// voxels per tet
@@ -256,6 +257,16 @@ __global__ void k_vox(cur3d_element* elems, r3d_int nelem, r3d_real* rho, r3d_dv
 		atomicAdd(&rho[vflat], cur3d_clip_and_reduce(tet, gidx, d));
 	}
 }
+
+
+// parallel prefix scan in shared memory
+// scan is in-place, so the result replaces the input array
+// assumes input of length THREADS_PER_SM
+// returns sum of all input elements
+/*__device__ r3d_int cur3du_cumsum(r3d_int* arr) {*/
+	/*__shared__ */
+
+/*}*/
 
 __device__ void cur3du_get_aabb(cur3d_element tet, r3d_dvec3 n, r3d_rvec3 d, r3d_dvec3 &vmin, r3d_dvec3 &vmax) {
 
