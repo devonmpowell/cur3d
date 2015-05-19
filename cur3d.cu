@@ -11,15 +11,15 @@ __global__ void k_vox(cur3d_element* elems, r3d_int nelem, r3d_real* rho, r3d_dv
 __device__ void cur3du_get_aabb(cur3d_element tet, r3d_dvec3 n, r3d_rvec3 d, r3d_dvec3 &vmin,
 r3d_dvec3 &vmax);
 
-__device__ r3d_real cur3d_clip_and_reduce(cur3d_element tet, r3d_int i, r3d_int j, r3d_int k,
-r3d_rvec3 d);
+__device__ r3d_real cur3d_clip_and_reduce(cur3d_element tet, r3d_dvec3 gidx, r3d_rvec3 d);
 __device__ void cur3d_clip_tet(r3d_poly* poly, unsigned char andcmp);
 __device__ void cur3d_reduce(r3d_poly* poly, r3d_int polyorder, r3d_real* moments);
 __device__ void cur3du_init_box(r3d_poly* poly, r3d_rvec3 rbounds[2]);
-__device__ r3d_real cur3du_orient(r3d_rvec3 pa, r3d_rvec3 pb, r3d_rvec3 pc, r3d_rvec3 pd);
+__device__ r3d_real cur3du_orient(cur3d_element tet);
 __device__ void cur3du_tet_faces_from_verts(r3d_rvec3* verts, r3d_plane* faces);
 __host__ void cur3d_err(cudaError_t err, char* msg);
 
+__device__ r3d_int cur3du_num_clip(cur3d_element tet, r3d_dvec3 gidx, r3d_rvec3 d);
 
 
 // useful macros
@@ -94,20 +94,17 @@ __global__ void k_vox(cur3d_element* elems, r3d_int nelem, r3d_real* rho, r3d_dv
 	// TODO: group clip-and-reduce operations by number of clip faces
 	__shared__ r3d_int face_voxels[2*THREADS_PER_SM];
 	__shared__ r3d_int face_tets[2*THREADS_PER_SM];
+	r3d_int tag_face;
+	r3d_int nclip;
 
 	// working vars
 	cur3d_element tet;
-	r3d_dvec3 vmin, vmax, vn; // voxel index range
-	r3d_int voff, vflat, i, j, k, f, ii, jj, kk; // counters and such
+	r3d_dvec3 vmin, vmax, vn, gidx; // voxel index range
+	r3d_int voff, vflat; // counters and such
 	r3d_int tid; // local (shared memory) tet id
 	r3d_int gid; // global tet id
 	r3d_int vid; // local (shared memory) voxel id
-	r3d_real tetvol;
-	r3d_rvec3 gpt;
-	unsigned char orcmp, andcmp, fflags;
 	r3d_int bufind;
-
-	r3d_plane faces[4];
 
 
 	// STEP 1
@@ -129,8 +126,8 @@ __global__ void k_vox(cur3d_element* elems, r3d_int nelem, r3d_real* rho, r3d_dv
 	__shared__ r3d_int voxels_this_block;
 	if(threadIdx.x == 0) {
 		voxels_this_block = 0;
-		for(i = 0; i < blockDim.x; ++i)
-			voxels_this_block += numvox[i];
+		for(gidx.i = 0; gidx.i < blockDim.x; ++gidx.i)
+			voxels_this_block += numvox[gidx.i];
 	}
 	__syncthreads();
 
@@ -183,46 +180,18 @@ __global__ void k_vox(cur3d_element* elems, r3d_int nelem, r3d_real* rho, r3d_dv
 	
 		// get the grid index of this voxel
 		vflat = vid - voff; 
-		i = vflat/(vn.j*vn.k); 
-		j = (vflat - vn.j*vn.k*i)/vn.k;
-		k = vflat - vn.j*vn.k*i - vn.k*j;
-		i += vmin.i; j += vmin.j; k += vmin.k;
+		gidx.i = vflat/(vn.j*vn.k); 
+		gidx.j = (vflat - vn.j*vn.k*gidx.i)/vn.k;
+		gidx.k = vflat - vn.j*vn.k*gidx.i - vn.k*gidx.j;
+		gidx.i += vmin.i; gidx.j += vmin.j; gidx.k += vmin.k;
 
-		// TODO: Put this dedicated AABB computation into a dedicated function
-
-		// properly orient the tet
-		tetvol = cur3du_orient(tet.pos[0], tet.pos[1], tet.pos[2], tet.pos[3]);
-		if(tetvol < 0.0) {
-			gpt = tet.pos[2];
-			tet.pos[2] = tet.pos[3];
-			tet.pos[3] = gpt;
-			tetvol = -tetvol;
-		}
-
-		// TODO: This does some sqrts that might not be needed...
-		cur3du_tet_faces_from_verts(tet.pos, faces);
-	
-		// test the bin corners against tet faces to determine voxel type
-		orcmp = 0x00;
-		andcmp = 0x0f;
-		for(ii = 0; ii < 2; ++ii)
-		for(jj = 0; jj < 2; ++jj)
-		for(kk = 0; kk < 2; ++kk) {
-			gpt.x = (ii + i)*d.x; gpt.y = (jj + j)*d.y; gpt.z = (kk + k)*d.z;
-			fflags = 0x00;
-			for(f = 0; f < 4; ++f) 
-				if(faces[f].d + dot(gpt, faces[f].n) > 0.0) fflags |= (1 << f);
-			andcmp &= fflags;
-			orcmp |= fflags;
-		}
-
-		r3d_int tag_face = 0;
-
-		// handle the appropriate voxel types
-		if(andcmp == 0x0f) 
-			atomicAdd(&rho[n.j*n.k*i + n.k*j + k], tet.mass/(tetvol + 1.0e-99));
-		else if(orcmp == 0x0f) tag_face = 1;
-		__syncthreads();
+		// check the voxel against the tet faces
+		tag_face = 0;
+		nclip = cur3du_num_clip(tet, gidx, d);
+		if(nclip == 0) // completely contained voxel 
+			atomicAdd(&rho[n.j*n.k*gidx.i + n.k*gidx.j + gidx.k], tet.mass/(fabs(cur3du_orient(tet)) + 1.0e-99));
+		else if(nclip > 0) // voxel must be clipped
+			tag_face = 1;
 
 		// STEP 3
 		// accumulate face voxels to a ring buffer
@@ -245,7 +214,7 @@ __global__ void k_vox(cur3d_element* elems, r3d_int nelem, r3d_real* rho, r3d_dv
 
 		// parallel write to the ring buffer
 		if(tag_face) {
-			face_voxels[(vbuf_end + bufind)%(2*THREADS_PER_SM)] = n.j*n.k*i + n.k*j + k;
+			face_voxels[(vbuf_end + bufind)%(2*THREADS_PER_SM)] = n.j*n.k*gidx.i + n.k*gidx.j + gidx.k;
 			face_tets[(vbuf_end + bufind)%(2*THREADS_PER_SM)] = tid;
 		}
 		if(threadIdx.x == blockDim.x - 1) {
@@ -258,13 +227,13 @@ __global__ void k_vox(cur3d_element* elems, r3d_int nelem, r3d_real* rho, r3d_dv
 
 			// recompute i, j, k, faces for this voxel
 			vflat = face_voxels[(threadIdx.x + vbuf_start)%(2*THREADS_PER_SM)]; 
-			i = vflat/(n.j*n.k); 
-			j = (vflat - n.j*n.k*i)/n.k;
-			k = vflat - n.j*n.k*i - n.k*j;
+			gidx.i = vflat/(n.j*n.k); 
+			gidx.j = (vflat - n.j*n.k*gidx.i)/n.k;
+			gidx.k = vflat - n.j*n.k*gidx.i - n.k*gidx.j;
 			tet = elems[blockIdx.x*blockDim.x + face_tets[(threadIdx.x + vbuf_start)%(2*THREADS_PER_SM)]];
 
 			// clip and reduce to grid
-			atomicAdd(&rho[vflat], cur3d_clip_and_reduce(tet, i, j, k, d));
+			atomicAdd(&rho[vflat], cur3d_clip_and_reduce(tet, gidx, d));
 
 			// shift ring buffer head
 			vbuf_start += THREADS_PER_SM;
@@ -278,13 +247,13 @@ __global__ void k_vox(cur3d_element* elems, r3d_int nelem, r3d_real* rho, r3d_dv
 
 		// recompute i, j, k, faces for this voxel
 		vflat = face_voxels[(threadIdx.x + vbuf_start)%(2*THREADS_PER_SM)]; 
-		i = vflat/(n.j*n.k); 
-		j = (vflat - n.j*n.k*i)/n.k;
-		k = vflat - n.j*n.k*i - n.k*j;
+		gidx.i = vflat/(n.j*n.k); 
+		gidx.j = (vflat - n.j*n.k*gidx.i)/n.k;
+		gidx.k = vflat - n.j*n.k*gidx.i - n.k*gidx.j;
 		tet = elems[blockIdx.x*blockDim.x + face_tets[(threadIdx.x + vbuf_start)%(2*THREADS_PER_SM)]];
 
 		// clip and reduce to grid
-		atomicAdd(&rho[vflat], cur3d_clip_and_reduce(tet, i, j, k, d));
+		atomicAdd(&rho[vflat], cur3d_clip_and_reduce(tet, gidx, d));
 	}
 }
 
@@ -319,7 +288,50 @@ __device__ void cur3du_get_aabb(cur3d_element tet, r3d_dvec3 n, r3d_rvec3 d, r3d
 
 }
 
-__device__ r3d_real cur3d_clip_and_reduce(cur3d_element tet, r3d_int i, r3d_int j, r3d_int k, r3d_rvec3 d) {
+__device__ r3d_int cur3du_num_clip(cur3d_element tet, r3d_dvec3 gidx, r3d_rvec3 d) {
+
+	r3d_real tetvol;
+	r3d_plane faces[4];
+	r3d_rvec3 gpt;
+	r3d_int f, ii, jj, kk;
+	unsigned char andcmp, orcmp, fflags;
+	/*r3d_int nclip;*/
+
+	// properly orient the tet
+	tetvol = cur3du_orient(tet);
+	if(tetvol < 0.0) {
+		gpt = tet.pos[2];
+		tet.pos[2] = tet.pos[3];
+		tet.pos[3] = gpt;
+		tetvol = -tetvol;
+	}
+
+	// TODO: This does some sqrts that might not be needed...
+	cur3du_tet_faces_from_verts(tet.pos, faces);
+	
+	// test the bin corners against tet faces to determine voxel type
+	orcmp = 0x00;
+	andcmp = 0x0f;
+	for(ii = 0; ii < 2; ++ii)
+	for(jj = 0; jj < 2; ++jj)
+	for(kk = 0; kk < 2; ++kk) {
+		gpt.x = (ii + gidx.i)*d.x; gpt.y = (jj + gidx.j)*d.y; gpt.z = (kk + gidx.k)*d.z;
+		fflags = 0x00;
+		for(f = 0; f < 4; ++f) 
+			if(faces[f].d + dot(gpt, faces[f].n) > 0.0) fflags |= (1 << f);
+		andcmp &= fflags;
+		orcmp |= fflags;
+	}
+
+	// if the voxel is completely outside the tet, return -1
+	if(orcmp < 0x0f) return -1;
+	
+	// else, return the number of faces to be clipped against
+	return 4 - __popc(andcmp);
+}
+
+
+__device__ r3d_real cur3d_clip_and_reduce(cur3d_element tet, r3d_dvec3 gidx, r3d_rvec3 d) {
 
 	r3d_real moments[10];
 	r3d_poly poly;
@@ -334,7 +346,7 @@ __device__ r3d_real cur3d_clip_and_reduce(cur3d_element tet, r3d_int i, r3d_int 
 	r3d_rvec3 gpt;
 	unsigned char andcmp;
 
-	tetvol = cur3du_orient(tet.pos[0], tet.pos[1], tet.pos[2], tet.pos[3]);
+	tetvol = cur3du_orient(tet);
 	if(tetvol < 0.0) {
 		gpt = tet.pos[2];
 		tet.pos[2] = tet.pos[3];
@@ -347,7 +359,7 @@ __device__ r3d_real cur3d_clip_and_reduce(cur3d_element tet, r3d_int i, r3d_int 
 	for(ii = 0; ii < 2; ++ii)
 	for(jj = 0; jj < 2; ++jj)
 	for(kk = 0; kk < 2; ++kk) {
-		gpt.x = (ii + i)*d.x; gpt.y = (jj + j)*d.y; gpt.z = (kk + k)*d.z;
+		gpt.x = (ii + gidx.i)*d.x; gpt.y = (jj + gidx.j)*d.y; gpt.z = (kk + gidx.k)*d.z;
 		v = cur3d_vv[4*ii + 2*jj + kk];
 		poly.verts[v].orient.fflags = 0x00;
 		for(f = 0; f < 4; ++f) {
@@ -635,19 +647,19 @@ __device__ void cur3du_init_box(r3d_poly* poly, r3d_rvec3 rbounds[2]) {
 	vertbuffer[7].pos.z = rbounds[1].z; 
 }
 
-__device__ r3d_real cur3du_orient(r3d_rvec3 pa, r3d_rvec3 pb, r3d_rvec3 pc, r3d_rvec3 pd) {
+__device__ r3d_real cur3du_orient(cur3d_element tet) {
 	r3d_real adx, bdx, cdx;
 	r3d_real ady, bdy, cdy;
 	r3d_real adz, bdz, cdz;
-	adx = pa.x - pd.x;
-	bdx = pb.x - pd.x;
-	cdx = pc.x - pd.x;
-	ady = pa.y - pd.y;
-	bdy = pb.y - pd.y;
-	cdy = pc.y - pd.y;
-	adz = pa.z - pd.z;
-	bdz = pb.z - pd.z;
-	cdz = pc.z - pd.z;
+	adx = tet.pos[0].x - tet.pos[3].x;
+	bdx = tet.pos[1].x - tet.pos[3].x;
+	cdx = tet.pos[2].x - tet.pos[3].x;
+	ady = tet.pos[0].y - tet.pos[3].y;
+	bdy = tet.pos[1].y - tet.pos[3].y;
+	cdy = tet.pos[2].y - tet.pos[3].y;
+	adz = tet.pos[0].z - tet.pos[3].z;
+	bdz = tet.pos[1].z - tet.pos[3].z;
+	cdz = tet.pos[2].z - tet.pos[3].z;
 	return -ONE_SIXTH*(adx * (bdy * cdz - bdz * cdy)
 			+ bdx * (cdy * adz - cdz * ady)
 			+ cdx * (ady * bdz - adz * bdy));
