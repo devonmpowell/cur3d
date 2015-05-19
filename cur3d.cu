@@ -81,23 +81,26 @@ __host__ void cur3d_voxelize_elements(cur3d_element* elems_h, r3d_int nelem, r3d
 
 __global__ void k_vox(cur3d_element* elems, r3d_int nelem, r3d_real* rho, r3d_dvec3 n, r3d_rvec3 d) {
 
-	// voxels per tet
-	__shared__ r3d_int numvox[THREADS_PER_SM]; // voxels per tet
 
 	// voxel ring buffer
-	// TODO: use smaller ring buffer?
 	// TODO: group clip-and-reduce operations by number of clip faces
 	__shared__ r3d_int face_voxels[2*THREADS_PER_SM];
 	__shared__ r3d_int face_tets[2*THREADS_PER_SM];
+	__shared__ r3d_int vbuf_start, vbuf_end; 
+
 	r3d_int tag_face;
 	r3d_int nclip;
 
 	__shared__ r3d_int cuminds[THREADS_PER_SM];
 
+	// voxels per tet
+	__shared__ r3d_int voxels_per_tet[THREADS_PER_SM];
+	__shared__ r3d_int voxels_per_block;
+
 	// working vars
 	cur3d_element tet;
 	r3d_dvec3 vmin, vmax, vn, gidx; // voxel index range
-	r3d_int voff, vflat; // counters and such
+	r3d_int vflat; // counters and such
 	r3d_int tid; // local (shared memory) tet id
 	r3d_int gid; // global tet id
 	r3d_int vid; // local (shared memory) voxel id
@@ -109,62 +112,44 @@ __global__ void k_vox(cur3d_element* elems, r3d_int nelem, r3d_real* rho, r3d_dv
 	// assumes that the total tet batch is <= GPU threads
 	tid = threadIdx.x;
  	gid = blockIdx.x*blockDim.x + tid;
-	numvox[tid] = 0;
+	voxels_per_tet[tid] = 0;
 	if(gid < nelem) {
 		cur3du_get_aabb(elems[gid], n, d, vmin, vmax);
-		numvox[tid] = (vmax.i - vmin.i)*(vmax.j - vmin.j)*(vmax.k - vmin.k); 
+		voxels_per_tet[tid] = (vmax.i - vmin.i)*(vmax.j - vmin.j)*(vmax.k - vmin.k); 
 	}
 	__syncthreads();
 
-	// STEP 1.5
-	// TODO: Better prefix sum implementation! 
-	// this is an ultra-stupid serial version
-	__shared__ r3d_int voxels_this_block;
-	if(threadIdx.x == 0) {
-		voxels_this_block = 0;
-		for(gidx.i = 0; gidx.i < blockDim.x; ++gidx.i)
-			voxels_this_block += numvox[gidx.i];
-	}
+	if(threadIdx.x == blockDim.x - 1)
+		voxels_per_block = voxels_per_tet[threadIdx.x];
+	cur3du_cumsum(voxels_per_tet);
+	if(threadIdx.x == blockDim.x - 1)
+		voxels_per_block += voxels_per_tet[threadIdx.x];
 	__syncthreads();
 
 	// STEP 2
 	// process all voxels in the AABBs and bin into separate buffers
 	// for face and interior voxels
 	// each thread gets one voxel
-	__shared__ r3d_int tid_last; // last voxels and tids for the last thread in each loop
-	__shared__ r3d_int voff_last; // last voxels and tids for the last thread in each loop
-
-	// absolute indices in the voxel ring buffer 
-	__shared__ r3d_int vbuf_start; 
-	__shared__ r3d_int vbuf_end; 
 
 	if(threadIdx.x == 0) {
-		tid_last = 0;
-		voff_last = 0;
-
 		vbuf_start = 0;
 		vbuf_end = 0;
 	}
 
 	__syncthreads();
 
-	for(vid = threadIdx.x; vid < voxels_this_block; vid += blockDim.x) {
+	for(vid = threadIdx.x; vid < voxels_per_block; vid += blockDim.x) {
 
-		// short naive prefix scan to get voxel offset
-		// TODO: Faster implementation!
-		// if a prefix scan over all shared-memory indices 
-		// is done, can use binary search here... is it even worth it?
-		tid = tid_last; // this voxel's tet, in the local array 
-		voff = voff_last; // offset of this tet in voxels
-		while(voff + numvox[tid] < vid)
-			voff += numvox[tid++];
-
-		// save the last voxel for faster scan in the next loop
-		if(threadIdx.x == blockDim.x - 1) {
-			tid_last = tid;
-			voff_last = voff;	
+		// binary search through cumulative voxel indices
+		// to get the correct tet
+		r3d_int btm = 0;
+		r3d_int top = THREADS_PER_SM; 
+		tid = (btm + top)/2;
+		while(vid < voxels_per_tet[tid] || vid >= voxels_per_tet[tid+1]) {
+			if(vid < voxels_per_tet[tid]) top = tid;
+			else btm = tid + 1;
+			tid = (btm + top)/2;
 		}
-		
 	 	gid = blockIdx.x*blockDim.x + tid; // global array
 		tet = elems[gid];
 
@@ -174,7 +159,7 @@ __global__ void k_vox(cur3d_element* elems, r3d_int nelem, r3d_real* rho, r3d_dv
 		vn.i = vmax.i - vmin.i;
 		vn.j = vmax.j - vmin.j;
 		vn.k = vmax.k - vmin.k;
-		vflat = vid - voff; 
+		vflat = vid - voxels_per_tet[tid]; 
 		gidx.i = vflat/(vn.j*vn.k); 
 		gidx.j = (vflat - vn.j*vn.k*gidx.i)/vn.k;
 		gidx.k = vflat - vn.j*vn.k*gidx.i - vn.k*gidx.j;
@@ -189,16 +174,16 @@ __global__ void k_vox(cur3d_element* elems, r3d_int nelem, r3d_real* rho, r3d_dv
 		else if(nclip > 0) // voxel must be clipped
 			tag_face = 1;
 
+		__syncthreads();
+
 		// STEP 3
 		// accumulate face voxels to a ring buffer
 		
 		// use prefix scan in shared memory to get the buffer indices for parallel write
+		// then, parallel write to the ring buffer
 		cuminds[threadIdx.x] = tag_face;
 		cur3du_cumsum(cuminds);
-
 		bufind = cuminds[threadIdx.x];
-
-		// parallel write to the ring buffer
 		if(tag_face) {
 			face_voxels[(vbuf_end + bufind)%(2*THREADS_PER_SM)] = n.j*n.k*gidx.i + n.k*gidx.j + gidx.k;
 			face_tets[(vbuf_end + bufind)%(2*THREADS_PER_SM)] = tid;
@@ -209,7 +194,7 @@ __global__ void k_vox(cur3d_element* elems, r3d_int nelem, r3d_real* rho, r3d_dv
 		__syncthreads();
 
 		// finally, parallel reduction of face voxels (1 per thread)
-		if(vbuf_end - vbuf_start > THREADS_PER_SM) {
+		if(vbuf_end - vbuf_start >= THREADS_PER_SM) {
 
 			// recompute i, j, k, faces for this voxel
 			vflat = face_voxels[(threadIdx.x + vbuf_start)%(2*THREADS_PER_SM)]; 
@@ -248,7 +233,7 @@ __global__ void k_vox(cur3d_element* elems, r3d_int nelem, r3d_real* rho, r3d_dv
 // scan is in-place, so the result replaces the input array
 // assumes input of length THREADS_PER_SM
 // returns sum of all input elements
-// from GPU Gems
+// from GPU Gems 3, ch. 39
 __device__ void cur3du_cumsum(r3d_int* arr) {
 
 	// TODO: faster scan operation might be needed
@@ -268,17 +253,14 @@ __device__ void cur3du_cumsum(r3d_int* arr) {
 		offset *= 2;
 	}
 
-	// scan back down the tree
-
 	// clear the last element
 	if (threadIdx.x == 0)
 		arr[THREADS_PER_SM - 1] = 0;   
 
 	// traverse down the tree building the scan in place
-	for (int d = 1; d < THREADS_PER_SM; d *= 2) {
+	for (d = 1; d < THREADS_PER_SM; d *= 2) {
 		offset >>= 1;
 		__syncthreads();
-
 		if (threadIdx.x < d) {
 			ai = offset*(2*threadIdx.x+1)-1;
 			bi = offset*(2*threadIdx.x+2)-1;
