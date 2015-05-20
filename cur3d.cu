@@ -9,8 +9,6 @@ __global__ void cur3d_vox_kernel(cur3d_element* elems, r3d_int nelem, r3d_real* 
 __host__ void cur3d_err(cudaError_t err, char* msg);
 
 __device__ r3d_real cur3d_clip_and_reduce(cur3d_element tet, r3d_dvec3 gidx, r3d_rvec3 d);
-__device__ void cur3d_clip_tet(r3d_poly* poly, unsigned char andcmp);
-__device__ void cur3d_reduce(r3d_poly* poly, r3d_int polyorder, r3d_real* moments);
 
 __device__ void cur3du_cumsum(r3d_int* arr);
 __device__ void cur3du_get_aabb(cur3d_element tet, r3d_dvec3 n, r3d_rvec3 d, r3d_dvec3 &vmin, r3d_dvec3 &vmax);
@@ -219,6 +217,91 @@ __global__ void cur3d_vox_kernel(cur3d_element* elems, r3d_int nelem, r3d_real* 
 	}
 }
 
+__device__ r3d_real cur3d_reduce(r3d_poly* poly) {
+
+	// var declarations
+	r3d_real locvol;
+	unsigned char v, np, m;
+	unsigned char vcur, vnext, pnext, vstart;
+	r3d_rvec3 v0, v1, v2; 
+
+	// direct access to vertex buffer
+	r3d_vertex* vertbuffer = poly->verts; 
+	r3d_int* nverts = &poly->nverts; 
+	
+	// for keeping track of which edges have been traversed
+	unsigned char emarks[R3D_MAX_VERTS][3];
+	memset((void*) &emarks, 0, sizeof(emarks));
+
+	// stack for edges
+	r3d_int nvstack;
+	unsigned char vstack[2*R3D_MAX_VERTS];
+
+	// find the first unclipped vertex
+	vcur = R3D_MAX_VERTS;
+	for(v = 0; vcur == R3D_MAX_VERTS && v < *nverts; ++v) 
+		if(!(vertbuffer[v].orient.fflags & CLIP_MASK)) vcur = v;
+	
+	// return if all vertices have been clipped
+	if(vcur == R3D_MAX_VERTS) return 0.0;
+
+	locvol = 0;
+
+	// stack implementation
+	nvstack = 0;
+	vstack[nvstack++] = vcur;
+	vstack[nvstack++] = 0;
+
+	while(nvstack > 0) {
+		
+		// get the next unmarked edge
+		do {
+			pnext = vstack[--nvstack];
+			vcur = vstack[--nvstack];
+		} while(emarks[vcur][pnext] && nvstack > 0);
+		if(emarks[vcur][pnext] && nvstack == 0) break; 
+
+		// initialize face looping
+		emarks[vcur][pnext] = 1;
+		vstart = vcur;
+		v0 = vertbuffer[vstart].pos;
+		vnext = vertbuffer[vcur].pnbrs[pnext];
+		vstack[nvstack++] = vcur;
+		vstack[nvstack++] = (pnext+1)%3;
+
+		// move to the second edge
+		for(np = 0; np < 3; ++np) if(vertbuffer[vnext].pnbrs[np] == vcur) break;
+		vcur = vnext;
+		pnext = (np+1)%3;
+		emarks[vcur][pnext] = 1;
+		vnext = vertbuffer[vcur].pnbrs[pnext];
+		vstack[nvstack++] = vcur;
+		vstack[nvstack++] = (pnext+1)%3;
+
+		// make a triangle fan using edges
+		// and first vertex
+		while(vnext != vstart) {
+
+			v2 = vertbuffer[vcur].pos;
+			v1 = vertbuffer[vnext].pos;
+
+			locvol += ONE_SIXTH*(-(v2.x*v1.y*v0.z) + v1.x*v2.y*v0.z + v2.x*v0.y*v1.z
+				   	- v0.x*v2.y*v1.z - v1.x*v0.y*v2.z + v0.x*v1.y*v2.z); 
+
+			// move to the next edge
+			for(np = 0; np < 3; ++np) if(vertbuffer[vnext].pnbrs[np] == vcur) break;
+			vcur = vnext;
+			pnext = (np+1)%3;
+			emarks[vcur][pnext] = 1;
+			vnext = vertbuffer[vcur].pnbrs[pnext];
+			vstack[nvstack++] = vcur;
+			vstack[nvstack++] = (pnext+1)%3;
+		}
+	}
+	return locvol;
+}
+
+
 __device__ r3d_real cur3d_clip_and_reduce(cur3d_element tet, r3d_dvec3 gidx, r3d_rvec3 d) {
 
 	r3d_real moments[10];
@@ -262,10 +345,223 @@ __device__ r3d_real cur3d_clip_and_reduce(cur3d_element tet, r3d_dvec3 gidx, r3d
 		andcmp &= poly.verts[v].orient.fflags;
 
 	cur3du_init_box(&poly, rbounds);
-	cur3d_clip_tet(&poly, andcmp);
-	cur3d_reduce(&poly, 0, moments);
 
-	return tet.mass/(tetvol + 1.0e-99)*moments[0]/(d.x*d.y*d.z);
+	//// CLIP /////
+
+	// variable declarations
+	r3d_int nvstack;
+	unsigned char vstack[4*R3D_MAX_VERTS];
+	unsigned char ff, np, vcur, vprev, firstnewvert, prevnewvert;
+	unsigned char fmask, ffmask;
+
+	// direct access to vertex buffer
+	r3d_vertex* vertbuffer = poly.verts; 
+	r3d_int* nverts = &poly.nverts; 
+			
+	for(f = 0; f < 4; ++f) {
+
+		// go to the next active clip face
+		fmask = (1 << f);
+		while((andcmp & fmask) && f < 4)
+			fmask = (1 << ++f);
+		if(f == 4) break;
+
+		// find the first vertex lying outside of the face
+		// only need to find one (taking advantage of convexity)
+		vcur = R3D_MAX_VERTS;
+		for(v = 0; vcur == R3D_MAX_VERTS && v < *nverts; ++v) 
+			if(!(vertbuffer[v].orient.fflags & (CLIP_MASK | fmask))) vcur = v;
+		if(vcur == R3D_MAX_VERTS) continue; // TODO: can we do better here in terms of warp divergence?
+		
+		// push the first three edges and mark the starting vertex
+		// as having been clipped
+		nvstack = 0;
+		vstack[nvstack++] = vcur;
+		vstack[nvstack++] = vertbuffer[vcur].pnbrs[1];
+		vstack[nvstack++] = vcur;
+		vstack[nvstack++] = vertbuffer[vcur].pnbrs[0];
+		vstack[nvstack++] = vcur;
+		vstack[nvstack++] = vertbuffer[vcur].pnbrs[2];
+		vertbuffer[vcur].orient.fflags |= CLIP_MASK;
+		firstnewvert = *nverts;
+		prevnewvert = R3D_MAX_VERTS; 
+
+		// traverse edges and clip
+		// this is ordered very carefully to preserve edge connectivity
+		while(nvstack > 0) {
+
+			// get the next unclipped vertex
+			do {
+				vcur = vstack[--nvstack];
+				vprev = vstack[--nvstack];
+			} while((vertbuffer[vcur].orient.fflags & CLIP_MASK) && nvstack > 0);
+			if((vertbuffer[vcur].orient.fflags & CLIP_MASK) && nvstack == 0) break; 
+
+			// check whether this vertex is inside the face
+			// if so, clip the edge and push the new vertex to vertbuffer
+			if(vertbuffer[vcur].orient.fflags & fmask) {
+
+				// compute the intersection point using a weighted
+				// average of perpendicular distances to the plane
+				wav(vertbuffer[vcur].pos, -vertbuffer[vprev].orient.fdist[f],
+					vertbuffer[vprev].pos, vertbuffer[vcur].orient.fdist[f],
+					vertbuffer[*nverts].pos);
+
+				// doubly link to vcur
+				for(np = 0; np < 3; ++np) if(vertbuffer[vcur].pnbrs[np] == vprev) break;
+				vertbuffer[vcur].pnbrs[np] = *nverts;
+				vertbuffer[*nverts].pnbrs[0] = vcur;
+
+				// doubly link to previous new vert
+				vertbuffer[*nverts].pnbrs[2] = prevnewvert; 
+				vertbuffer[prevnewvert].pnbrs[1] = *nverts;
+
+				// do face intersections and flags
+				vertbuffer[*nverts].orient.fflags = 0x00;
+				for(ff = f + 1; ff < 4; ++ff) {
+
+					// TODO: might not need this one...
+					/*ffmask = (1 << ff);*/
+					/*while((andcmp & ffmask) && ff < 4)*/
+						/*ffmask = (1 << ++ff);*/
+					/*if(ff == 4) break;*/
+
+					// skip if all verts are inside ff
+					ffmask = (1 << ff); 
+					if(andcmp & ffmask) continue;
+
+					// weighted average keeps us in a relative coordinate system
+					vertbuffer[*nverts].orient.fdist[ff] = 
+							(vertbuffer[vprev].orient.fdist[ff]*vertbuffer[vcur].orient.fdist[f] 
+							- vertbuffer[vprev].orient.fdist[f]*vertbuffer[vcur].orient.fdist[ff])
+							/(vertbuffer[vcur].orient.fdist[f] - vertbuffer[vprev].orient.fdist[f]);
+					if(vertbuffer[*nverts].orient.fdist[ff] > 0.0) vertbuffer[*nverts].orient.fflags |= ffmask;
+				}
+
+				prevnewvert = (*nverts)++;
+			}
+			else {
+
+				// otherwise, determine the left and right vertices
+				// (ordering is important) and push to the traversal stack
+				for(np = 0; np < 3; ++np) if(vertbuffer[vcur].pnbrs[np] == vprev) break;
+
+				// mark the vertex as having been clipped
+				vertbuffer[vcur].orient.fflags |= CLIP_MASK;
+
+				// push the next verts to the stack
+				vstack[nvstack++] = vcur;
+				vstack[nvstack++] = vertbuffer[vcur].pnbrs[(np+2)%3];
+				vstack[nvstack++] = vcur;
+				vstack[nvstack++] = vertbuffer[vcur].pnbrs[(np+1)%3];
+			}
+		}
+
+		// close the clipped face
+		vertbuffer[firstnewvert].pnbrs[2] = *nverts-1;
+		vertbuffer[prevnewvert].pnbrs[1] = firstnewvert;
+	}
+
+	////// REDUCE ///////
+
+#if 0
+	// var declarations
+	r3d_real locvol;
+	unsigned char m;
+	unsigned char vnext, pnext, vstart;
+	r3d_rvec3 v0, v1, v2; 
+
+	r3d_int polyorder = 0;
+	
+	// for keeping track of which edges have been traversed
+	unsigned char emarks[R3D_MAX_VERTS][3];
+	memset((void*) &emarks, 0, sizeof(emarks));
+
+	// zero the moments
+	for(m = 0; m < 10; ++m)
+		moments[m] = 0.0;
+
+	// find the first unclipped vertex
+	vcur = R3D_MAX_VERTS;
+	for(v = 0; vcur == R3D_MAX_VERTS && v < *nverts; ++v) 
+		if(!(vertbuffer[v].orient.fflags & CLIP_MASK)) vcur = v;
+	
+	// return if all vertices have been clipped
+	if(vcur == R3D_MAX_VERTS) return 0.0;
+
+	// stack implementation
+	nvstack = 0;
+	vstack[nvstack++] = vcur;
+	vstack[nvstack++] = 0;
+
+	while(nvstack > 0) {
+		
+		pnext = vstack[--nvstack];
+		vcur = vstack[--nvstack];
+
+		// skip this edge if we have marked it
+		if(emarks[vcur][pnext]) continue;
+
+
+		// initialize face looping
+		emarks[vcur][pnext] = 1;
+		vstart = vcur;
+		v0 = vertbuffer[vstart].pos;
+		vnext = vertbuffer[vcur].pnbrs[pnext];
+		vstack[nvstack++] = vcur;
+		vstack[nvstack++] = (pnext+1)%3;
+
+		// move to the second edge
+		for(np = 0; np < 3; ++np) if(vertbuffer[vnext].pnbrs[np] == vcur) break;
+		vcur = vnext;
+		pnext = (np+1)%3;
+		emarks[vcur][pnext] = 1;
+		vnext = vertbuffer[vcur].pnbrs[pnext];
+		vstack[nvstack++] = vcur;
+		vstack[nvstack++] = (pnext+1)%3;
+
+		// make a triangle fan using edges
+		// and first vertex
+		while(vnext != vstart) {
+
+			v2 = vertbuffer[vcur].pos;
+			v1 = vertbuffer[vnext].pos;
+
+			locvol = ONE_SIXTH*(-(v2.x*v1.y*v0.z) + v1.x*v2.y*v0.z + v2.x*v0.y*v1.z
+				   	- v0.x*v2.y*v1.z - v1.x*v0.y*v2.z + v0.x*v1.y*v2.z); 
+
+			moments[0] += locvol; 
+			if(polyorder >= 1) {
+				moments[1] += locvol*0.25*(v0.x + v1.x + v2.x);
+				moments[2] += locvol*0.25*(v0.y + v1.y + v2.y);
+				moments[3] += locvol*0.25*(v0.z + v1.z + v2.z);
+			}
+			if(polyorder >= 2) {
+				moments[4] += locvol*0.1*(v0.x*v0.x + v1.x*v1.x + v2.x*v2.x + v1.x*v2.x + v0.x*(v1.x + v2.x));
+				moments[5] += locvol*0.1*(v0.y*v0.y + v1.y*v1.y + v2.y*v2.y + v1.y*v2.y + v0.y*(v1.y + v2.y));
+				moments[6] += locvol*0.1*(v0.z*v0.z + v1.z*v1.z + v2.z*v2.z + v1.z*v2.z + v0.z*(v1.z + v2.z));
+				moments[7] += locvol*0.05*(v2.x*v0.y + v2.x*v1.y + 2*v2.x*v2.y + v0.x*(2*v0.y + v1.y + v2.y) + v1.x*(v0.y + 2*v1.y + v2.y));
+				moments[8] += locvol*0.05*(v2.y*v0.z + v2.y*v1.z + 2*v2.y*v2.z + v0.y*(2*v0.z + v1.z + v2.z) + v1.y*(v0.z + 2*v1.z + v2.z));
+				moments[9] += locvol*0.05*(v2.x*v0.z + v2.x*v1.z + 2*v2.x*v2.z + v0.x*(2*v0.z + v1.z + v2.z) + v1.x*(v0.z + 2*v1.z + v2.z));
+			}
+
+			// move to the next edge
+			for(np = 0; np < 3; ++np) if(vertbuffer[vnext].pnbrs[np] == vcur) break;
+			vcur = vnext;
+			pnext = (np+1)%3;
+			emarks[vcur][pnext] = 1;
+			vnext = vertbuffer[vcur].pnbrs[pnext];
+			vstack[nvstack++] = vcur;
+			vstack[nvstack++] = (pnext+1)%3;
+		}
+	}
+#endif
+
+
+
+
+
+	return tet.mass/(tetvol + 1.0e-99)*cur3d_reduce(&poly)/(d.x*d.y*d.z);
 
 }
 
@@ -384,215 +680,6 @@ __device__ r3d_int cur3du_num_clip(cur3d_element tet, r3d_dvec3 gidx, r3d_rvec3 
 	
 	// else, return the number of faces to be clipped against
 	return 4 - __popc(andcmp);
-}
-
-
-__device__ void cur3d_clip_tet(r3d_poly* poly, unsigned char andcmp) {
-
-	// variable declarations
-	r3d_int nvstack;
-	unsigned char vstack[4*R3D_MAX_VERTS];
-	unsigned char v, f, ff, np, vcur, vprev, firstnewvert, prevnewvert;
-	unsigned char fmask, ffmask;
-
-	// direct access to vertex buffer
-	r3d_vertex* vertbuffer = poly->verts; 
-	r3d_int* nverts = &poly->nverts; 
-			
-	for(f = 0; f < 4; ++f) {
-
-		fmask = (1 << f);
-		if(andcmp & fmask) continue;
-
-		// find the first vertex lying outside of the face
-		// only need to find one (taking advantage of convexity)
-		vcur = R3D_MAX_VERTS;
-		for(v = 0; vcur == R3D_MAX_VERTS && v < *nverts; ++v) 
-			if(!(vertbuffer[v].orient.fflags & (CLIP_MASK | fmask))) vcur = v;
-		if(vcur == R3D_MAX_VERTS) continue;
-		
-		// push the first three edges and mark the starting vertex
-		// as having been clipped
-		nvstack = 0;
-		vstack[nvstack++] = vcur;
-		vstack[nvstack++] = vertbuffer[vcur].pnbrs[1];
-		vstack[nvstack++] = vcur;
-		vstack[nvstack++] = vertbuffer[vcur].pnbrs[0];
-		vstack[nvstack++] = vcur;
-		vstack[nvstack++] = vertbuffer[vcur].pnbrs[2];
-		vertbuffer[vcur].orient.fflags |= CLIP_MASK;
-		firstnewvert = *nverts;
-		prevnewvert = R3D_MAX_VERTS; 
-
-		// traverse edges and clip
-		// this is ordered very carefully to preserve edge connectivity
-		while(nvstack > 0) {
-
-			// pop the stack
-			vcur = vstack[--nvstack];
-			vprev = vstack[--nvstack];
-
-			// if the vertex has already been clipped, ignore it
-			if(vertbuffer[vcur].orient.fflags & CLIP_MASK) continue; 
-
-			// check whether this vertex is inside the face
-			// if so, clip the edge and push the new vertex to vertbuffer
-			if(vertbuffer[vcur].orient.fflags & fmask) {
-
-				// compute the intersection point using a weighted
-				// average of perpendicular distances to the plane
-				wav(vertbuffer[vcur].pos, -vertbuffer[vprev].orient.fdist[f],
-					vertbuffer[vprev].pos, vertbuffer[vcur].orient.fdist[f],
-					vertbuffer[*nverts].pos);
-
-				// doubly link to vcur
-				for(np = 0; np < 3; ++np) if(vertbuffer[vcur].pnbrs[np] == vprev) break;
-				vertbuffer[vcur].pnbrs[np] = *nverts;
-				vertbuffer[*nverts].pnbrs[0] = vcur;
-
-				// doubly link to previous new vert
-				vertbuffer[*nverts].pnbrs[2] = prevnewvert; 
-				vertbuffer[prevnewvert].pnbrs[1] = *nverts;
-
-				// do face intersections and flags
-				vertbuffer[*nverts].orient.fflags = 0x00;
-				for(ff = f + 1; ff < 4; ++ff) {
-
-					// skip if all verts are inside ff
-					ffmask = (1 << ff); 
-					if(andcmp & ffmask) continue;
-
-					// weighted average keeps us in a relative coordinate system
-					vertbuffer[*nverts].orient.fdist[ff] = 
-							(vertbuffer[vprev].orient.fdist[ff]*vertbuffer[vcur].orient.fdist[f] 
-							- vertbuffer[vprev].orient.fdist[f]*vertbuffer[vcur].orient.fdist[ff])
-							/(vertbuffer[vcur].orient.fdist[f] - vertbuffer[vprev].orient.fdist[f]);
-					if(vertbuffer[*nverts].orient.fdist[ff] > 0.0) vertbuffer[*nverts].orient.fflags |= ffmask;
-				}
-
-				prevnewvert = (*nverts)++;
-			}
-			else {
-
-				// otherwise, determine the left and right vertices
-				// (ordering is important) and push to the traversal stack
-				for(np = 0; np < 3; ++np) if(vertbuffer[vcur].pnbrs[np] == vprev) break;
-
-				// mark the vertex as having been clipped
-				vertbuffer[vcur].orient.fflags |= CLIP_MASK;
-
-				// push the next verts to the stack
-				vstack[nvstack++] = vcur;
-				vstack[nvstack++] = vertbuffer[vcur].pnbrs[(np+2)%3];
-				vstack[nvstack++] = vcur;
-				vstack[nvstack++] = vertbuffer[vcur].pnbrs[(np+1)%3];
-			}
-		}
-
-		// close the clipped face
-		vertbuffer[firstnewvert].pnbrs[2] = *nverts-1;
-		vertbuffer[prevnewvert].pnbrs[1] = firstnewvert;
-	}
-
-}
-
-__device__ void cur3d_reduce(r3d_poly* poly, r3d_int polyorder, r3d_real* moments) {
-
-	// var declarations
-	r3d_real locvol;
-	unsigned char v, np, m;
-	unsigned char vcur, vnext, pnext, vstart;
-	r3d_rvec3 v0, v1, v2; 
-
-	// direct access to vertex buffer
-	r3d_vertex* vertbuffer = poly->verts; 
-	r3d_int* nverts = &poly->nverts; 
-	
-	// for keeping track of which edges have been traversed
-	unsigned char emarks[R3D_MAX_VERTS][3];
-	memset((void*) &emarks, 0, sizeof(emarks));
-
-	// stack for edges
-	r3d_int nvstack;
-	unsigned char vstack[2*R3D_MAX_VERTS];
-
-	// zero the moments
-	for(m = 0; m < 10; ++m)
-		moments[m] = 0.0;
-
-	// find the first unclipped vertex
-	vcur = R3D_MAX_VERTS;
-	for(v = 0; vcur == R3D_MAX_VERTS && v < *nverts; ++v) 
-		if(!(vertbuffer[v].orient.fflags & CLIP_MASK)) vcur = v;
-	
-	// return if all vertices have been clipped
-	if(vcur == R3D_MAX_VERTS) return;
-
-	// stack implementation
-	nvstack = 0;
-	vstack[nvstack++] = vcur;
-	vstack[nvstack++] = 0;
-
-	while(nvstack > 0) {
-		
-		pnext = vstack[--nvstack];
-		vcur = vstack[--nvstack];
-
-		// skip this edge if we have marked it
-		if(emarks[vcur][pnext]) continue;
-
-		// initialize face looping
-		emarks[vcur][pnext] = 1;
-		vstart = vcur;
-		v0 = vertbuffer[vstart].pos;
-		vnext = vertbuffer[vcur].pnbrs[pnext];
-		vstack[nvstack++] = vcur;
-		vstack[nvstack++] = (pnext+1)%3;
-
-		// move to the second edge
-		for(np = 0; np < 3; ++np) if(vertbuffer[vnext].pnbrs[np] == vcur) break;
-		vcur = vnext;
-		pnext = (np+1)%3;
-		emarks[vcur][pnext] = 1;
-		vnext = vertbuffer[vcur].pnbrs[pnext];
-		vstack[nvstack++] = vcur;
-		vstack[nvstack++] = (pnext+1)%3;
-
-		// make a triangle fan using edges
-		// and first vertex
-		while(vnext != vstart) {
-
-			v2 = vertbuffer[vcur].pos;
-			v1 = vertbuffer[vnext].pos;
-
-			locvol = ONE_SIXTH*(-(v2.x*v1.y*v0.z) + v1.x*v2.y*v0.z + v2.x*v0.y*v1.z
-				   	- v0.x*v2.y*v1.z - v1.x*v0.y*v2.z + v0.x*v1.y*v2.z); 
-
-			moments[0] += locvol; 
-			if(polyorder >= 1) {
-				moments[1] += locvol*0.25*(v0.x + v1.x + v2.x);
-				moments[2] += locvol*0.25*(v0.y + v1.y + v2.y);
-				moments[3] += locvol*0.25*(v0.z + v1.z + v2.z);
-			}
-			if(polyorder >= 2) {
-				moments[4] += locvol*0.1*(v0.x*v0.x + v1.x*v1.x + v2.x*v2.x + v1.x*v2.x + v0.x*(v1.x + v2.x));
-				moments[5] += locvol*0.1*(v0.y*v0.y + v1.y*v1.y + v2.y*v2.y + v1.y*v2.y + v0.y*(v1.y + v2.y));
-				moments[6] += locvol*0.1*(v0.z*v0.z + v1.z*v1.z + v2.z*v2.z + v1.z*v2.z + v0.z*(v1.z + v2.z));
-				moments[7] += locvol*0.05*(v2.x*v0.y + v2.x*v1.y + 2*v2.x*v2.y + v0.x*(2*v0.y + v1.y + v2.y) + v1.x*(v0.y + 2*v1.y + v2.y));
-				moments[8] += locvol*0.05*(v2.y*v0.z + v2.y*v1.z + 2*v2.y*v2.z + v0.y*(2*v0.z + v1.z + v2.z) + v1.y*(v0.z + 2*v1.z + v2.z));
-				moments[9] += locvol*0.05*(v2.x*v0.z + v2.x*v1.z + 2*v2.x*v2.z + v0.x*(2*v0.z + v1.z + v2.z) + v1.x*(v0.z + 2*v1.z + v2.z));
-			}
-
-			// move to the next edge
-			for(np = 0; np < 3; ++np) if(vertbuffer[vnext].pnbrs[np] == vcur) break;
-			vcur = vnext;
-			pnext = (np+1)%3;
-			emarks[vcur][pnext] = 1;
-			vnext = vertbuffer[vcur].pnbrs[pnext];
-			vstack[nvstack++] = vcur;
-			vstack[nvstack++] = (pnext+1)%3;
-		}
-	}
 }
 
 __device__ void cur3du_init_box(r3d_poly* poly, r3d_rvec3 rbounds[2]) {
