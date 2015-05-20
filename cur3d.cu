@@ -78,13 +78,17 @@ __host__ void cur3d_voxelize_elements(cur3d_element* elems_h, r3d_int nelem, r3d
 __global__ void cur3d_vox_kernel(cur3d_element* elems, r3d_int nelem, r3d_real* rho, r3d_dvec3 n, r3d_rvec3 d) {
 
 
-	// voxel ring buffer
+	// voxel ring buffers, separated by number of faces to clip against
 	// TODO: group clip-and-reduce operations by number of clip faces
-	__shared__ r3d_int face_voxels[2*THREADS_PER_SM];
-	__shared__ r3d_int face_tets[2*THREADS_PER_SM];
-	__shared__ r3d_int vbuf_start, vbuf_end; 
+	/*__shared__ r3d_int face_voxels[2*THREADS_PER_SM];*/
+	/*__shared__ r3d_int face_tets[2*THREADS_PER_SM];*/
+	__shared__ r3d_int clip_voxels[4][2*THREADS_PER_SM];
+	__shared__ r3d_int clip_tets[4][2*THREADS_PER_SM];
+	/*__shared__ r3d_int vbuf_start, vbuf_end; */
+	__shared__ r3d_int vbuf_start[4], vbuf_end[4]; 
 
-	r3d_int tag_face;
+	/*r3d_int tag_face;*/
+	r3d_int tag_face[4];
 	r3d_int nclip;
 
 	__shared__ r3d_int cuminds[THREADS_PER_SM];
@@ -102,6 +106,7 @@ __global__ void cur3d_vox_kernel(cur3d_element* elems, r3d_int nelem, r3d_real* 
 	r3d_int vid; // local (shared memory) voxel id
 	r3d_int btm;
 	r3d_int top;
+	r3d_int nf;
 	
 	// STEP 1
 	// calculate offsets of each tet in the global voxel array
@@ -124,10 +129,11 @@ __global__ void cur3d_vox_kernel(cur3d_element* elems, r3d_int nelem, r3d_real* 
 	// process all voxels in the AABBs and bin into separate buffers
 	// for face and interior voxels
 	// each thread gets one voxel
-	if(threadIdx.x == 0) {
-		vbuf_start = 0;
-		vbuf_end = 0;
-	}
+	if(threadIdx.x == 0)
+		for(nf = 0; nf < 4; ++nf) {
+			vbuf_start[nf] = 0;
+			vbuf_end[nf] = 0;
+		}
 	__syncthreads();
 	for(vid = threadIdx.x; vid < voxels_per_block; vid += blockDim.x) {
 
@@ -159,62 +165,87 @@ __global__ void cur3d_vox_kernel(cur3d_element* elems, r3d_int nelem, r3d_real* 
 		// check the voxel against the tet faces
 		nclip = cur3du_num_clip(tet, gidx, d);
 
-		tag_face = 0;
+		for(nf = 0; nf < 4; ++nf) tag_face[nf] = 0;
 		if(nclip == 0) // completely contained voxel 
 			atomicAdd(&rho[n.j*n.k*gidx.i + n.k*gidx.j + gidx.k], tet.mass/(fabs(cur3du_orient(tet)) + 1.0e-99));
 		else if(nclip > 0) // voxel must be clipped
-			tag_face = 1;
+			tag_face[nclip-1] = 1;
 
 		__syncthreads();
 
 		// STEP 3
 		// accumulate face voxels to a ring buffer
 		// parallel scan to get indices, then parallel write to the ring buffer
-		cuminds[threadIdx.x] = tag_face;
-		cur3du_cumsum(cuminds);
-		if(tag_face) {
-			face_voxels[(vbuf_end + cuminds[threadIdx.x])%(2*THREADS_PER_SM)] = n.j*n.k*gidx.i + n.k*gidx.j + gidx.k;
-			face_tets[(vbuf_end + cuminds[threadIdx.x])%(2*THREADS_PER_SM)] = tid;
+		for(nf = 0; nf < 4; ++nf) {
+			cuminds[threadIdx.x] = tag_face[nf];
+			cur3du_cumsum(cuminds);
+			if(tag_face[nf]) {
+				clip_voxels[nf][(vbuf_end[nf] + cuminds[threadIdx.x])%(2*THREADS_PER_SM)] = n.j*n.k*gidx.i + n.k*gidx.j + gidx.k;
+				clip_tets[nf][(vbuf_end[nf] + cuminds[threadIdx.x])%(2*THREADS_PER_SM)] = tid;
+			}
+			if(threadIdx.x == blockDim.x - 1)
+				vbuf_end[nf] += cuminds[threadIdx.x] + tag_face[nf];
+			__syncthreads();
 		}
-		if(threadIdx.x == blockDim.x - 1)
-			vbuf_end += cuminds[threadIdx.x] + tag_face;
-		__syncthreads();
 
 		// STEP 4
 		// parallel reduction of face voxels (1 per thread)
-		if(vbuf_end - vbuf_start >= THREADS_PER_SM) {
+		for(nf = 0; nf < 4; ++nf) {
+			if(vbuf_end[nf] - vbuf_start[nf] >= THREADS_PER_SM) {
 
-			// recompute i, j, k, faces for this voxel
-			vflat = face_voxels[(threadIdx.x + vbuf_start)%(2*THREADS_PER_SM)]; 
-			gidx.i = vflat/(n.j*n.k); 
-			gidx.j = (vflat - n.j*n.k*gidx.i)/n.k;
-			gidx.k = vflat - n.j*n.k*gidx.i - n.k*gidx.j;
-			tet = elems[blockIdx.x*blockDim.x + face_tets[(threadIdx.x + vbuf_start)%(2*THREADS_PER_SM)]];
+				// recompute i, j, k, faces for this voxel
+				vflat = clip_voxels[nf][(threadIdx.x + vbuf_start[nf])%(2*THREADS_PER_SM)]; 
+				gidx.i = vflat/(n.j*n.k); 
+				gidx.j = (vflat - n.j*n.k*gidx.i)/n.k;
+				gidx.k = vflat - n.j*n.k*gidx.i - n.k*gidx.j;
+				tet = elems[blockIdx.x*blockDim.x + clip_tets[nf][(threadIdx.x + vbuf_start[nf])%(2*THREADS_PER_SM)]];
 
-			// clip and reduce to grid
-			atomicAdd(&rho[vflat], cur3d_clip_and_reduce(tet, gidx, d));
+				// clip and reduce to grid
+				/*atomicAdd(&rho[vflat], cur3d_clip_and_reduce(tet, gidx, d));*/
 
-			// shift ring buffer head
-			if(threadIdx.x == 0)
-				vbuf_start += THREADS_PER_SM;
-		} 
-		__syncthreads();
+				// shift ring buffer head
+				if(threadIdx.x == 0)
+					vbuf_start[nf] += THREADS_PER_SM;
+			} 
+			__syncthreads();
+		}
 	}
 
 	// STEP 5
 	// clean up any face voxels remaining in the ring buffer
-	if(threadIdx.x < vbuf_end - vbuf_start) {
+		/*for(nf = 0; nf < 4; ++nf) {*/
+			/*if(threadIdx.x < vbuf_end[nf] - vbuf_start[nf]) {*/
 
-		// recompute i, j, k, faces for this voxel
-		vflat = face_voxels[(threadIdx.x + vbuf_start)%(2*THREADS_PER_SM)]; 
-		gidx.i = vflat/(n.j*n.k); 
-		gidx.j = (vflat - n.j*n.k*gidx.i)/n.k;
-		gidx.k = vflat - n.j*n.k*gidx.i - n.k*gidx.j;
-		tet = elems[blockIdx.x*blockDim.x + face_tets[(threadIdx.x + vbuf_start)%(2*THREADS_PER_SM)]];
+				/*// recompute i, j, k, faces for this voxel*/
+				/*vflat = clip_voxels[nf][(threadIdx.x + vbuf_start[nf])%(2*THREADS_PER_SM)]; */
+				/*gidx.i = vflat/(n.j*n.k); */
+				/*gidx.j = (vflat - n.j*n.k*gidx.i)/n.k;*/
+				/*gidx.k = vflat - n.j*n.k*gidx.i - n.k*gidx.j;*/
+				/*tet = elems[blockIdx.x*blockDim.x + clip_tets[nf][(threadIdx.x + vbuf_start[nf])%(2*THREADS_PER_SM)]];*/
 
-		// clip and reduce to grid
-		atomicAdd(&rho[vflat], cur3d_clip_and_reduce(tet, gidx, d));
-	}
+				/*// clip and reduce to grid*/
+				/*atomicAdd(&rho[vflat], cur3d_clip_and_reduce(tet, gidx, d));*/
+
+				/*// shift ring buffer head*/
+				/*if(threadIdx.x == 0)*/
+					/*vbuf_start[nf] += THREADS_PER_SM;*/
+			/*} */
+			/*__syncthreads();*/
+		/*}*/
+
+
+	/*if(threadIdx.x < vbuf_end - vbuf_start) {*/
+
+		/*// recompute i, j, k, faces for this voxel*/
+		/*vflat = face_voxels[(threadIdx.x + vbuf_start)%(2*THREADS_PER_SM)]; */
+		/*gidx.i = vflat/(n.j*n.k); */
+		/*gidx.j = (vflat - n.j*n.k*gidx.i)/n.k;*/
+		/*gidx.k = vflat - n.j*n.k*gidx.i - n.k*gidx.j;*/
+		/*tet = elems[blockIdx.x*blockDim.x + face_tets[(threadIdx.x + vbuf_start)%(2*THREADS_PER_SM)]];*/
+
+		/*// clip and reduce to grid*/
+		/*atomicAdd(&rho[vflat], cur3d_clip_and_reduce(tet, gidx, d));*/
+	/*}*/
 }
 
 __device__ r3d_real cur3d_reduce(r3d_poly* poly) {
